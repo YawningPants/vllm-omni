@@ -1188,6 +1188,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             if attn_path == "piecewise":
                 spans = self._build_full_attn_spans(image_ids)
                 attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
+                if hidden_states.device.type == "npu" and attn_path_hint == "auto" and not sp_active:
+                    attn_metadata.extra["qwen_image21_flex_prefill"] = True
+                    attn_metadata.extra["_qwen_image21_flex_cache"] = {}
             elif attn_path == "mask":
                 attn_metadata = AttentionMetadata(
                     attn_mask=self._build_block_causal_mask(

@@ -19,6 +19,72 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
         pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
     ],
 )
+def test_non_npu_prefill_preserves_piecewise_metadata(device):
+    seen = []
+
+    class CaptureBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SimpleNamespace(
+                attn=SimpleNamespace(attn_backend=SimpleNamespace(supports_piecewise_spans=True))
+            )
+
+        def forward(self, hidden_states, attn_metadata, **kwargs):
+            seen.append(attn_metadata)
+            return hidden_states
+
+    class SequencePrepare:
+        def __call__(self, hidden_states, text, layout, img_mask, is_decode):
+            return text, hidden_states, text.new_zeros(2, 1), hidden_states.new_zeros(2, 1)
+
+        @staticmethod
+        def expand_image_pad_mask(mask):
+            return mask
+
+    # Exercise the real model forward and metadata selection without weights.
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = None
+    model.causal_block = True
+    model.causal_condition = False
+    model.txt_in = torch.nn.Identity()
+    model.sequence_prepare = SequencePrepare()
+    model.time_text_embed = lambda timestep, hidden_states: timestep
+    model.modulation = torch.nn.Identity()
+    model.transformer_blocks = torch.nn.ModuleList([CaptureBlock()])
+    model.norm_out = lambda hidden_states, *args: hidden_states
+    model.proj_out = torch.nn.Identity()
+
+    hidden = torch.ones(1, 2, 4, device=device)
+    text = torch.zeros_like(hidden)
+    outputs = []
+    for attention_kwargs in (None, {"attn_path": "piecewise"}):
+        outputs.append(
+            model(
+                hidden_states=hidden,
+                encoder_hidden_states=text,
+                timestep=hidden.new_zeros(1),
+                img_shapes=[[(1, 1, 2)]],
+                img_mask=torch.tensor([[False, False, True, True]], device=device),
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+        )
+
+    for metadata in seen:
+        assert metadata.full_attn_spans == [[(2, 4)]]
+        assert metadata.attn_mask is None
+        assert metadata.extra == {}
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_qk_norm_matches_diffusers_rounding(monkeypatch, device, dtype):
     monkeypatch.setattr(

@@ -1120,6 +1120,33 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
 # models (e.g. Qwen-Image-2.1 prefill) and poisoned the cached prefix K/V.
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("enabled,flex_succeeds", [(False, False), (True, False), (True, True)])
+def test_npu_flex_prefill_preserves_piecewise_fallback(monkeypatch, enabled, flex_succeeds):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    query = torch.randn(1, 9, 2, 4)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5)
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5), (6, 9)]], extra={"qwen_image21_flex_prefill": enabled})
+    calls = []
+
+    def flex(q, k, v, supplied_metadata, scale):
+        assert supplied_metadata is metadata and scale == 0.5
+        calls.append("flex")
+        return query + 1 if flex_succeeds else None
+
+    def piecewise(q, k, v, supplied_metadata):
+        assert supplied_metadata is metadata
+        calls.append("piecewise")
+        return query + 2
+
+    monkeypatch.setattr(npu_flex_attention, "try_npu_flex_attention", flex)
+    monkeypatch.setattr(impl, "_forward_piecewise_npu", piecewise)
+    output = impl.forward_fa_npu(query, query, query, metadata)
+    assert calls == (["flex"] if enabled and flex_succeeds else ["flex", "piecewise"] if enabled else ["piecewise"])
+    torch.testing.assert_close(output, query + (1 if enabled and flex_succeeds else 2))
+
+
 def _npu_fusion_attention_reference(
     query,
     key,

@@ -933,6 +933,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # ``forward_cuda``: the caller emitted ``full_attn_spans`` instead of a
         # mask, so the generic mask handling below cannot express it.
         if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            if attn_metadata.extra.get("qwen_image21_flex_prefill"):
+                from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import try_npu_flex_attention
+
+                output = try_npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
+                if output is not None:
+                    logger.info_once("Qwen-Image 2.1 NPU prefill is using FlexAttention (BF16, BlockMask=128).")
+                    return output
             return self._forward_piecewise_npu(query, key, value, attn_metadata)
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
