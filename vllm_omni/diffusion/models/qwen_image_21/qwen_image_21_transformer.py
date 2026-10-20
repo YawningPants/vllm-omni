@@ -35,6 +35,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -1000,18 +1001,23 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         has_padding: bool,
         sp_padding: bool,
     ) -> str:
-        r"""Choose between the piecewise-span and dense-mask attention paths.
-
-        Returns one of `"piecewise"` (block-causal via `full_attn_spans`), `"mask"` (dense 4D mask)
-        or `"key_padding"` (no block-causal structure — `causal_block=False` or KV-cache decode).
-        """
+        """NPU defaults to dense mask; Flex and piecewise require explicit hints."""
+        if attn_path_hint == "flex":
+            backend = self.transformer_blocks[0].attn.attn.attn_backend
+            if not current_omni_platform.is_npu() or backend is None or backend.get_name() != "FLASH_ATTN":
+                raise ValueError('attn_path="flex" requires the NPU FLASH_ATTN backend.')
+            if not self.causal_block or has_padding or sp_padding:
+                raise ValueError('attn_path="flex" requires block-causal prefill without padding.')
+            return "flex"
         if not self.causal_block:
             return "key_padding"
         if attn_path_hint in ("piecewise", "mask"):
             return attn_path_hint
         if attn_path_hint != "auto":
-            raise ValueError(f"Unknown attn_path hint {attn_path_hint!r}; expected 'auto', 'piecewise' or 'mask'.")
-        if has_padding or sp_padding:
+            raise ValueError(
+                f"Unknown attn_path hint {attn_path_hint!r}; expected 'auto', 'piecewise', 'mask' or 'flex'."
+            )
+        if current_omni_platform.is_npu() or has_padding or sp_padding:
             return "mask"
         backend = self.transformer_blocks[0].attn.attn.attn_backend
         if backend is not None and backend.supports_piecewise_spans:
@@ -1048,7 +1054,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 `(batch_size, text_sequence_length)` bool marking valid text tokens. Padded positions are excluded
                 from attention.
             attention_kwargs (dict, *optional*): Extra options. Recognized key: `attn_path` — `"auto"` (default),
-                `"piecewise"` or `"mask"` to force the block-causal attention implementation.
+                `"piecewise"`, `"mask"` or `"flex"`. NPU auto uses mask; Flex is explicit NPU prefill only.
             kv_cache (list of dict, *optional*): One dict per block, keyed by CFG branch (`"cond"`/`"uncond"`).
                 Empty dicts prefill the text and condition-image keys and values; populated dicts switch to decode,
                 where only the target image's tokens are recomputed. Requires `causal_condition`.
@@ -1185,16 +1191,12 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
             if kv_cache is not None:
                 cache_write_len = prefix_len
-            if attn_path == "piecewise":
+            if attn_path in ("piecewise", "flex"):
+                if attn_path == "flex" and sp_active:
+                    raise ValueError('attn_path="flex" does not support sequence parallelism.')
                 spans = self._build_full_attn_spans(image_ids)
                 attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
-                # Keep explicit piecewise/mask overrides and SP on their existing paths.
-                if (
-                    attn_path_hint == "auto"
-                    and hidden_states.device.type == "npu"
-                    and not sp_active
-                    and not has_padding
-                ):
+                if attn_path == "flex":
                     attn_metadata.extra["qwen_image21_flex"] = True
             elif attn_path == "mask":
                 attn_metadata = AttentionMetadata(

@@ -364,7 +364,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             return replace(
                 result,
-                path="npu_flex_or_mask" if extra.get("qwen_image21_flex", False) else "npu_piecewise",
+                path="npu_flex" if extra.get("qwen_image21_flex", False) else "npu_piecewise",
                 support=CapabilityResult.unmigrated(
                     "NPU span routing only; kernel and compilation validation require Ascend"
                 ),
@@ -821,6 +821,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype")
         if method not in (None, "float", "auto"):
+            if extra.get("qwen_image21_flex", False):
+                raise ValueError('attn_path="flex" does not support quantized NPU attention.')
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
@@ -934,12 +936,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # mask, so the generic mask handling below cannot express it.
         if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             if not self.causal and attn_metadata.extra.get("qwen_image21_flex", False):
-                from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import try_npu_flex_attention
+                from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import npu_flex_attention
 
-                output = try_npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
-                if output is not None:
-                    return output
-                return self._forward_span_mask_npu(query, key, value, attn_metadata)
+                return npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
             return self._forward_piecewise_npu(query, key, value, attn_metadata)
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
@@ -1031,41 +1030,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,
-        )
-
-    def _forward_span_mask_npu(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Rebuild the full block-causal mask when Qwen prefill cannot use Flex."""
-        assert attn_metadata.full_attn_spans is not None
-        # Qwen shallow-copies metadata per layer. The shared extra dict keeps
-        # this request's mask reusable across layers without a global cache.
-        block_mask = attn_metadata.extra.get("qwen_image21_fallback_mask")
-        if block_mask is None:
-            query_length, key_length = query.shape[1], key.shape[1]
-            query_offset = key_length - query_length
-            query_positions = torch.arange(query_length, device=query.device) + query_offset
-            key_positions = torch.arange(key_length, device=query.device)
-            block_mask = (key_positions[None, :] > query_positions[:, None])[None, None]
-            block_mask = block_mask.expand(query.shape[0], 1, -1, -1).clone()
-            for batch, spans in enumerate(attn_metadata.full_attn_spans):
-                for start, end in spans:
-                    row_start, row_end = max(0, start - query_offset), min(query_length, end - query_offset)
-                    if row_start < row_end:
-                        block_mask[batch, 0, row_start:row_end, start:end] = False
-            attn_metadata.extra["qwen_image21_fallback_mask"] = block_mask
-
-        return self._npu_fusion_attention(
-            query,
-            key,
-            value,
-            atten_mask=block_mask,
-            sparse_mode=1,
-            softmax_scale=self.softmax_scale,
         )
 
     def _npu_piecewise_attn_func(
