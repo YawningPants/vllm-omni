@@ -10,6 +10,7 @@ This script tests two main scenarios:
 """
 
 import sys
+from copy import copy
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1231,6 +1232,96 @@ def test_npu_piecewise_matches_block_causal_reference(monkeypatch):
 
     assert out.shape == query.shape
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("opt_in,available", [(False, True), (True, True), (True, False)])
+def test_qwen_npu_flex_dispatch_and_mask_fallback(monkeypatch, opt_in, available):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    calls = []
+    impl = _npu_impl()
+    query = torch.randn(1, 6, 2, 4)
+    flex_output = torch.zeros_like(query)
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 6)]], extra={"qwen_image21_flex": opt_in})
+
+    def fake_flex(q, k, v, meta, scale):
+        assert meta is metadata and scale == impl.softmax_scale
+        calls.append("flex")
+        return flex_output if available else None
+
+    def fake_piecewise(q, k, v, meta):
+        calls.append("piecewise")
+        return q
+
+    def fake_mask(q, k, v, meta):
+        calls.append("mask")
+        return q
+
+    monkeypatch.setattr(npu_flex_attention, "try_npu_flex_attention", fake_flex)
+    monkeypatch.setattr(impl, "_forward_piecewise_npu", fake_piecewise)
+    monkeypatch.setattr(impl, "_forward_span_mask_npu", fake_mask)
+    output = impl.forward_fa_npu(query, query, query, metadata)
+    assert output is (flex_output if opt_in and available else query)
+    assert calls == (["flex"] if opt_in and available else ["flex", "mask"] if opt_in else ["piecewise"])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("image_ids", [[-1, -1, 0, 0, 0, 0], [-1, 0, 0, 1, 1, -1, 2, 2, -1]])
+def test_qwen_flex_fallback_preserves_mask_and_reuses_it(monkeypatch, batch_size, image_ids):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    impl = _npu_impl()
+    ids = torch.tensor(image_ids)
+    spans = [(int((ids == i).nonzero()[0]), int((ids == i).nonzero()[-1]) + 1) for i in ids.unique() if i >= 0]
+    metadata = AttentionMetadata(full_attn_spans=[spans] * batch_size, extra={"qwen_image21_flex": True})
+    generator = torch.Generator().manual_seed(42)
+    query, key, value = [torch.randn(batch_size, len(ids), 2, 4, generator=generator) for _ in range(3)]
+    positions = torch.arange(len(ids))
+    keep = (positions[:, None] >= positions[None, :]) | ((ids[:, None] >= 0) & (ids[:, None] == ids[None, :]))
+    masks = []
+
+    def masked_fa(q, k, v, *, head_num, input_layout, atten_mask, scale, keep_prob, inner_precise, sparse_mode):
+        assert input_layout == "BSND" and head_num == 2 and sparse_mode == 1
+        assert scale == impl.softmax_scale
+        assert atten_mask.shape == (batch_size, 1, len(ids), len(ids))
+        torch.testing.assert_close(atten_mask, (~keep)[None, None].expand_as(atten_mask))
+        masks.append(atten_mask)
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=~atten_mask, scale=scale
+        ).transpose(1, 2)
+        return (output,)
+
+    def fail_piecewise(*args, **kwargs):
+        pytest.fail("Flex fallback must use a full mask")
+
+    _fake_torch_npu(monkeypatch, npu_fusion_attention=masked_fa)
+    monkeypatch.setattr(npu_flex_attention, "try_npu_flex_attention", lambda *args: None)
+    monkeypatch.setattr(impl, "_forward_piecewise_npu", fail_piecewise)
+    expected = _block_causal_reference(query, key, value, ids, impl.softmax_scale)
+    for _ in range(2):
+        output = impl.forward_fa_npu(query, key, value, copy(metadata))
+        torch.testing.assert_close(output, expected, atol=1e-6, rtol=1e-5)
+    assert masks[0] is masks[1]
+
+
+@pytest.mark.cpu
+def test_qwen_flex_opt_in_does_not_override_quantized_attention(monkeypatch):
+    impl = _npu_impl()
+    query = torch.randn(1, 6, 2, 4)
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 6)]], extra={"qwen_image21_flex": True, "kv_cache_dtype": "fp8"})
+
+    def quantized(q, k, v, meta):
+        assert meta is metadata
+        return q
+
+    def fail(*args, **kwargs):
+        pytest.fail("quantized attention must not enter the non-quantized Flex path")
+
+    monkeypatch.setattr(impl, "forward_fa_quant_npu", quantized)
+    monkeypatch.setattr(impl, "forward_fa_npu", fail)
+    assert impl.forward_npu(query, query, query, metadata) is query
 
 
 if __name__ == "__main__":
