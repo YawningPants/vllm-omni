@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contracts for the compiled kernel, without importing vLLM or torch_npu."""
 
+import builtins
 import importlib.util
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -14,13 +16,19 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 @pytest.fixture
-def flex_module():
+def flex_module(monkeypatch):
     # Load this dependency-light helper directly; each case gets fresh runtime
     # state, and environments without vLLM can still exercise its contracts.
     path = Path(__file__).resolve().parents[3] / "vllm_omni/diffusion/attention/backends/utils/npu_flex_attention.py"
     spec = importlib.util.spec_from_file_location("npu_flex_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # CPU tests isolate the vendor package. Registration order is covered below;
+    # actual NPU registration/codegen is exercised by test_flex_attn.py.
+    npu = ModuleType("torch_npu")
+    npu._inductor = ModuleType("torch_npu._inductor")
+    monkeypatch.setitem(sys.modules, "torch_npu", npu)
+    monkeypatch.setitem(sys.modules, "torch_npu._inductor", npu._inductor)
     return module
 
 
@@ -132,6 +140,46 @@ def cpu_flex_call(flex_module, monkeypatch):
 
 
 @torch.no_grad()
+def test_npu_registration_precedes_mask_creation_and_compile(flex_module, monkeypatch):
+    from torch.nn.attention import flex_attention as flex_api
+
+    events = []
+    real_import = builtins.__import__
+    real_create = flex_api.create_block_mask
+
+    def registered_flex(q, k, v, *, block_mask, scale):
+        events.append("run")
+        return q
+
+    def initialize_npu(name, *args, **kwargs):
+        if name == "torch_npu._inductor":
+            events.append("register")
+            # The real vendor import patches the public FlexAttention API.
+            monkeypatch.setattr(flex_api, "flex_attention", registered_flex)
+        return real_import(name, *args, **kwargs)
+
+    def create(*args, **kwargs):
+        assert events == ["register"]
+        events.append("mask")
+        return real_create(*args, **kwargs)
+
+    def compile_call(fn, **kwargs):
+        assert fn is registered_flex
+        assert events == ["register", "mask"]
+        events.append("compile")
+        return fn
+
+    monkeypatch.setattr(flex_module, "_can_use_flex", lambda *args: True)
+    monkeypatch.setattr(builtins, "__import__", initialize_npu)
+    monkeypatch.setattr(flex_api, "create_block_mask", create)
+    monkeypatch.setattr(torch, "compile", compile_call)
+    q = torch.zeros(1, 9, 2, 8, dtype=torch.bfloat16)
+    actual = flex_module.try_npu_flex_attention(q, q, q, _metadata(), 0.5)
+    torch.testing.assert_close(actual, q)
+    assert events == ["register", "mask", "compile", "run"]
+
+
+@torch.no_grad()
 def test_layout_scale_numerics_and_request_mask_reuse(flex_module, cpu_flex_call):
     generator = torch.Generator().manual_seed(42)
     q, k, v = [torch.randn(1, 9, 2, 8, generator=generator).bfloat16() for _ in range(3)]
@@ -199,6 +247,7 @@ def test_explicit_disable_avoids_importing_compiler(flex_module, monkeypatch):
         pytest.fail("explicit disable must return before probing the Flex environment")
 
     monkeypatch.setattr(flex_module, "_can_use_flex", should_not_probe)
+    monkeypatch.setitem(sys.modules, "torch_npu._inductor", None)
     q = torch.zeros(1, 9, 2, 8, dtype=torch.bfloat16)
     assert flex_module.try_npu_flex_attention(q, q, q, _metadata(), 0.5) is None
     assert flex_module._compiled_flex is None
@@ -211,6 +260,7 @@ def test_non_npu_input_never_enters_compiler(flex_module, monkeypatch, device_ty
         pytest.fail("non-NPU input must not load or modify the Flex compiler")
 
     monkeypatch.delenv("QWEN_IMAGE21_FLEX_ATTN", raising=False)
+    monkeypatch.setitem(sys.modules, "torch_npu._inductor", None)
     monkeypatch.setattr(torch, "compile", unexpected_compiler)
     query = SimpleNamespace(device=SimpleNamespace(type=device_type), ndim=4, shape=(1, 9, 2, 8), dtype=torch.bfloat16)
     metadata = _metadata()

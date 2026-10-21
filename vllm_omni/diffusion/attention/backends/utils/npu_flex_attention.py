@@ -82,6 +82,9 @@ def try_npu_flex_attention(query, key, value, metadata: AttentionMetadata, softm
         return None
     if not _can_use_flex(query, key, value, metadata):
         return None
+    # Register NPU FlexAttention validation and lowering before importing the
+    # public API or entering Dynamo; lazy backend loading happens too late.
+    import torch_npu._inductor  # noqa: F401
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
     spans = tuple(metadata.full_attn_spans[0])
